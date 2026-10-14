@@ -89,10 +89,15 @@ class EditorController extends StateNotifier<EditorUiState> {
   // "保存" action (see saveToDisk / openImage restore).
   String? _path;
 
-  // While the crop overlay is up, the native preview ignores the crop so the
-  // user can see (and drag against) the whole image. Export always uses the
+  // While the crop overlay is up, the native preview ignores the crop rect so
+  // the user can see (and drag against) the whole image. Export always uses the
   // real geometry; see [exportImage].
   bool _cropEditing = false;
+
+  // Whether the native preview bakes in the 90° turns. True only on the beauty
+  // / liquify tabs (their overlays map source<->display through the turns);
+  // everywhere else the rotation is applied visually, so this stays false.
+  bool _nativeTurns = false;
 
   // Guards against overlapping FaceMesh inference calls (single-flight).
   bool _faceDetecting = false;
@@ -114,6 +119,7 @@ class EditorController extends StateNotifier<EditorUiState> {
       final saved = await loadEdits(path) ?? const EditState();
       _history = HistoryStack(initial: saved);
       _cropEditing = false;
+      _nativeTurns = false;
       state = state.copyWith(
         imageId: opened.imageId,
         edit: saved,
@@ -124,7 +130,7 @@ class EditorController extends StateNotifier<EditorUiState> {
         clearPreview: true,
         clearFace: true,
       );
-      await _applyParams(opened.imageId, saved);
+      await _applyParams(opened.imageId, _payload(saved));
       await _renderNow(1280);
     } catch (e) {
       if (gen != _gen) return;
@@ -204,8 +210,8 @@ class EditorController extends StateNotifier<EditorUiState> {
     // crop-neutralized preview payload from crop-overlay mode.
     await _applyParams(id, state.edit);
     final saved = await _channel.exportImage(id, format: format, quality: quality);
-    // Restore the crop-editing payload so the on-screen preview stays put.
-    if (_cropEditing) await _applyParams(id, _payload(state.edit));
+    // Restore the preview-mode payload so the on-screen frame stays put.
+    await _applyParams(id, _payload(state.edit));
     return saved;
   }
 
@@ -226,10 +232,18 @@ class EditorController extends StateNotifier<EditorUiState> {
     await saveEdits(path, state.edit);
   }
 
-  /// The edit payload sent to native: crop-neutralized while the crop overlay
-  /// is being dragged, verbatim otherwise.
-  EditState _payload(EditState e) =>
-      _cropEditing ? e.copyWith(adjustments: e.adjustments.withCropNeutralized()) : e;
+  /// The edit payload sent to native for the *preview*: the crop rect is
+  /// neutralized while the crop overlay is up, and the 90° turns are stripped
+  /// unless the active tab bakes rotation natively (beauty / liquify). Export
+  /// bypasses this and always uses the real geometry; see [exportImage].
+  EditState _payload(EditState e) {
+    var a = e.adjustments;
+    if (!_nativeTurns) a = a.copyWith(cropTurns: 0);
+    if (_cropEditing) {
+      a = a.copyWith(cropLeft: 0, cropTop: 0, cropRight: 1, cropBottom: 1);
+    }
+    return e.copyWith(adjustments: a);
+  }
 
   /// Sends [e] to native together with the current face-mesh key points so the
   /// warp engine sees both manual impulses and the auto face sliders.
@@ -259,11 +273,17 @@ class EditorController extends StateNotifier<EditorUiState> {
     }
   }
 
-  /// Enter / leave crop-overlay mode; re-renders so the canvas flips between
-  /// the full frame and the cropped result.
-  Future<void> setCropEditing(bool on) async {
-    if (_cropEditing == on) return;
-    _cropEditing = on;
+  /// Sync the preview geometry mode to the active tab: [cropEditing] shows the
+  /// full frame for overlay dragging; [nativeTurns] bakes the 90° rotation into
+  /// the native frame (beauty / liquify) instead of rotating it visually.
+  /// Re-renders only when the mode actually changes.
+  Future<void> setPreviewMode({
+    required bool cropEditing,
+    required bool nativeTurns,
+  }) async {
+    if (_cropEditing == cropEditing && _nativeTurns == nativeTurns) return;
+    _cropEditing = cropEditing;
+    _nativeTurns = nativeTurns;
     final id = state.imageId;
     if (id == null) return;
     await _applyParams(id, _payload(state.edit));

@@ -39,6 +39,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   String? _openedPath;
   late final TabController _tab;
+  int _prevTab = 0;
 
   // Pinch-zoom transform for the preview canvas. Shared so entering crop /
   // beauty tabs or opening a new image can reset it to 1:1 (those tabs drive
@@ -50,6 +51,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   LiquifyBrush _liquifyBrush = LiquifyBrush.push;
   double _liquifySize = 0.5;
   double _liquifyStrength = 0.5;
+
+  // Whether the bottom editing sheet is expanded. Toggled from its handle so
+  // the canvas can be viewed unobstructed (panel slides down out of view).
+  bool _panelVisible = true;
 
   @override
   void initState() {
@@ -67,19 +72,25 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     super.dispose();
   }
 
-  /// Entering the crop tab shows the *full* frame (crop neutralized in the
-  /// native preview) so the overlay can be dragged against the whole image;
-  /// leaving it re-renders the cropped result.
+  /// Sync the preview geometry mode to the active tab. Runs on every committed
+  /// switch (tap *or* swipe): the crop tab shows the full frame for overlay
+  /// dragging, beauty / liquify bake the rotation into the native frame (their
+  /// overlays map through it), and every other tab shows the rotation visually
+  /// so it never resets when leaving the crop tab.
   void _onTabChanged() {
-    if (!_tab.indexIsChanging) return; // fire once per committed switch
+    final tab = _tab.index;
     _tfc.value = Matrix4.identity();
     setState(() {});
-    ref.read(editorProvider.notifier).setCropEditing(_tab.index == _cropTab);
+    ref.read(editorProvider.notifier).setPreviewMode(
+          cropEditing: tab == _cropTab,
+          nativeTurns: tab == _beautyTab || tab == _liquifyTab,
+        );
     // Entering the liquify tab auto-runs FaceMesh so the guide + 4 auto sliders
     // light up (and so a restored session re-seeds the recomputable keypoints).
-    if (_tab.index == _liquifyTab) {
+    if (tab == _liquifyTab && _prevTab != _liquifyTab) {
       ref.read(editorProvider.notifier).detectFace();
     }
+    _prevTab = tab;
   }
 
   void _openIfChanged() {
@@ -134,7 +145,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   color: Theme.of(context).colorScheme.onErrorContainer),
             ),
           ),
-        _panelSheet(),
+        _panelArea(),
       ],
     );
   }
@@ -202,38 +213,49 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final cropping = _tab.index == _cropTab;
     final beautying = _tab.index == _beautyTab;
     final liquifying = _tab.index == _liquifyTab;
-    // During crop editing the native frame is the full source; pin the canvas
-    // to the source aspect so the overlay stays put even mid-re-render.
-    final aspect = cropping && state.sourceAspect > 0
-        ? state.sourceAspect
+    final srcAspect = state.sourceAspect > 0 ? state.sourceAspect : 1.0;
+    final turns = ((adj.cropTurns.round() % 4) + 4) % 4;
+    // The 90° turns are applied VISUALLY (RotatedBox over image + overlay) on
+    // every tab except beauty / liquify, whose overlays map source<->display
+    // through the turns themselves and therefore need the native frame to carry
+    // the rotation. Keeping rotation visual on the plain tabs means it never
+    // flashes or resets when switching away from the crop tab.
+    final visualRotate = !(beautying || liquifying);
+    final rt = visualRotate ? turns : 0;
+    // Aspect of the *unrotated* native frame currently shown.
+    final nativeAspect = cropping
+        ? srcAspect
         : (state.aspectRatio > 0 ? state.aspectRatio : 1.0);
+    // Aspect of the on-screen box once the visual rotation is applied.
+    final boxAspect = rt.isOdd ? 1 / nativeAspect : nativeAspect;
 
     return LayoutBuilder(builder: (context, cons) {
       var w = cons.maxWidth;
-      var h = w / aspect;
+      var h = w / boxAspect;
       if (h > cons.maxHeight) {
         h = cons.maxHeight;
-        w = h * aspect;
+        w = h * boxAspect;
       }
-      final imgRect = Rect.fromLTWH(
-        cons.maxWidth / 2 - w / 2,
-        cons.maxHeight / 2 - h / 2,
-        w,
-        h,
-      );
+      // Unrotated content size the image + overlay are laid out on; RotatedBox
+      // then turns it into the w×h on-screen box.
+      final inner = rt.isOdd ? Size(h, w) : Size(w, h);
+      final imgRect = Offset.zero & inner;
 
       final image = Positioned.fromRect(
         rect: imgRect,
         child: (state.busy && state.preview == null)
             ? const Center(child: CircularProgressIndicator(strokeWidth: 2))
-            : PreviewImage(image: state.preview, aspectRatio: aspect),
+            : PreviewImage(
+                image: state.preview,
+                aspectRatio: nativeAspect),
       );
 
       // Crop / beauty / liquify tabs drive their own gestures against an
       // un-zoomed imgRect, so they keep the plain stacked layout (no pinch) and
       // pin the overlay to the same rect as the frame.
+      Widget stack;
       if (cropping || beautying || liquifying) {
-        return Stack(children: [
+        stack = Stack(children: [
           image,
           if (cropping)
             Positioned.fromRect(
@@ -256,7 +278,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               rect: imgRect,
               child: _SpotLayer(
                 adj: adj,
-                boxSize: imgRect.size,
+                boxSize: inner,
                 onAddSpot: (srcNorm) {
                   controller.updateAdjustment((a) => a.withSpots(
                       [...a.spots,
@@ -271,10 +293,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               rect: imgRect,
               child: LiquifyOverlay(
                 adj: adj,
-                boxSize: imgRect.size,
-                srcAspect: state.sourceAspect > 0
-                    ? state.sourceAspect
-                    : aspect,
+                boxSize: inner,
+                srcAspect: srcAspect,
                 brush: _liquifyBrush,
                 brushSize: _liquifySize,
                 strength: _liquifyStrength,
@@ -286,80 +306,144 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               ),
             ),
         ]);
+      } else {
+        stack = Stack(children: [image]);
       }
 
+      Widget content = SizedBox.fromSize(size: inner, child: stack);
+      if (rt != 0) {
+        content = RotatedBox(quarterTurns: rt, child: content);
+      }
+
+      if (cropping || beautying || liquifying) {
+        return Center(child: content);
+      }
       // All other tabs: the canvas is inspection-only, so let two fingers
       // pinch-zoom / pan the preview for close-up retouching.
-      return InteractiveViewer(
-        transformationController: _tfc,
-        minScale: 1.0,
-        maxScale: 6.0,
-        child: Stack(children: [image]),
+      return Center(
+        child: InteractiveViewer(
+          transformationController: _tfc,
+          minScale: 1.0,
+          maxScale: 6.0,
+          child: content,
+        ),
       );
     });
   }
 
-  Widget _panelSheet() {
-    final scheme = Theme.of(context).colorScheme;
+  /// The bottom editing sheet: an always-visible chevron handle that toggles
+  /// expansion, plus the tab body. Collapsing animates the body's height to 0
+  /// (bottom-anchored + clipped) so it slides down out of view and the canvas
+  /// above grows to fill; expanding slides it back up from the bottom.
+  Widget _panelArea() {
     final t = context.fluent;
     return GlassSurface(
       radius: const BorderRadius.vertical(
           top: Radius.circular(MuPicPalette.radiusLg)),
       blur: MuPicPalette.blurStrong,
-      child: SizedBox(
-        height: 300,
-        child: Column(
-          children: [
-            const SizedBox(height: 6),
-            TabBar(
-              controller: _tab,
-              isScrollable: true,
-              tabAlignment: TabAlignment.start,
-              labelColor: scheme.primary,
-              unselectedLabelColor: t.textSecondary,
-              indicatorColor: scheme.primary,
-              indicatorWeight: 3,
-              dividerColor: Colors.transparent,
-              labelStyle: const TextStyle(
-                  fontWeight: FontWeight.w600, fontSize: 14),
-              tabs: const [
-                Tab(text: '基础'),
-                Tab(text: '曲线'),
-                Tab(text: '颜色'),
-                Tab(text: '调色'),
-                Tab(text: '细节'),
-                Tab(text: '镜头'),
-                Tab(text: '美颜'),
-                Tab(text: '裁剪'),
-                Tab(text: '液化'),
-              ],
-            ),
-            Expanded(
-              child: TabBarView(
-                controller: _tab,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          GestureDetector(
+            onTap: () => setState(() => _panelVisible = !_panelVisible),
+            behavior: HitTestBehavior.opaque,
+            child: Container(
+              height: 40,
+              width: double.infinity,
+              alignment: Alignment.center,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const BasicPanel(),
-                  const ToneCurvePanel(),
-                  const HslPanel(),
-                  const GradingPanel(),
-                  const DetailPanel(),
-                  const LensPanel(),
-                  const BeautyPanel(),
-                  const CropPanel(),
-                  LiquifyPanel(
-                    brush: _liquifyBrush,
-                    onBrushChanged: (b) => setState(() => _liquifyBrush = b),
-                    brushSize: _liquifySize,
-                    onBrushSizeChanged: (v) => setState(() => _liquifySize = v),
-                    strength: _liquifyStrength,
-                    onStrengthChanged: (v) =>
-                        setState(() => _liquifyStrength = v),
+                  Icon(
+                    _panelVisible
+                        ? PhosphorIconsRegular.caretDown
+                        : PhosphorIconsRegular.caretUp,
+                    size: 18,
+                    color: t.textPrimary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _panelVisible ? '收起面板' : '展开面板',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: t.textPrimary,
+                    ),
                   ),
                 ],
               ),
             ),
-          ],
-        ),
+          ),
+          ClipRect(
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 280),
+              curve: Curves.easeInOut,
+              height: _panelVisible ? 300 : 0,
+              alignment: Alignment.bottomCenter,
+              child: _panelBody(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _panelBody() {
+    final scheme = Theme.of(context).colorScheme;
+    final t = context.fluent;
+    return SizedBox(
+      height: 300,
+      child: Column(
+        children: [
+          const SizedBox(height: 6),
+          TabBar(
+            controller: _tab,
+            isScrollable: true,
+            tabAlignment: TabAlignment.start,
+            labelColor: scheme.primary,
+            unselectedLabelColor: t.textSecondary,
+            indicatorColor: scheme.primary,
+            indicatorWeight: 3,
+            dividerColor: Colors.transparent,
+            labelStyle: const TextStyle(
+                fontWeight: FontWeight.w600, fontSize: 14),
+            tabs: const [
+              Tab(text: '基础'),
+              Tab(text: '曲线'),
+              Tab(text: '颜色'),
+              Tab(text: '调色'),
+              Tab(text: '细节'),
+              Tab(text: '镜头'),
+              Tab(text: '美颜'),
+              Tab(text: '裁剪'),
+              Tab(text: '液化'),
+            ],
+          ),
+          Expanded(
+            child: TabBarView(
+              controller: _tab,
+              children: [
+                const BasicPanel(),
+                const ToneCurvePanel(),
+                const HslPanel(),
+                const GradingPanel(),
+                const DetailPanel(),
+                const LensPanel(),
+                const BeautyPanel(),
+                const CropPanel(),
+                LiquifyPanel(
+                  brush: _liquifyBrush,
+                  onBrushChanged: (b) => setState(() => _liquifyBrush = b),
+                  brushSize: _liquifySize,
+                  onBrushSizeChanged: (v) => setState(() => _liquifySize = v),
+                  strength: _liquifyStrength,
+                  onStrengthChanged: (v) =>
+                      setState(() => _liquifyStrength = v),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

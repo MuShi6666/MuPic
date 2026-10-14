@@ -33,10 +33,54 @@ class _AlbumScreenState extends ConsumerState<AlbumScreen> {
   bool _loading = true;
   bool _granted = false;
 
+  // Pagination state for on-demand (infinite) loading of the album.
+  AssetPathEntity? _album;
+  int _page = 0;
+  static const int _pageSize = 120;
+  bool _hasMore = true;
+  bool _loadingMore = false;
+  final ScrollController _scroll = ScrollController();
+
   @override
   void initState() {
     super.initState();
+    _scroll.addListener(_onScroll);
     _load();
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  /// Kicks off the next page when the grid is scrolled near its bottom.
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    if (pos.pixels >= pos.maxScrollExtent - 800) {
+      _loadMore();
+    }
+  }
+
+  /// Appends the next page of assets without re-triggering a full reload.
+  Future<void> _loadMore() async {
+    final album = _album;
+    if (album == null || _loading || _loadingMore || !_hasMore) return;
+    setState(() => _loadingMore = true);
+    final next = _page + 1;
+    final list = await album.getAssetListPaged(page: next, size: _pageSize);
+    if (!mounted) return;
+    setState(() {
+      _loadingMore = false;
+      if (list.isEmpty) {
+        _hasMore = false;
+      } else {
+        _assets = [..._assets, ...list];
+        _page = next;
+        _hasMore = list.length >= _pageSize;
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -48,18 +92,31 @@ class _AlbumScreenState extends ConsumerState<AlbumScreen> {
       setState(() => _loading = false);
       return;
     }
+    // Sort by creation time descending so the newest photos come first. The
+    // platform default (no ORDER BY) returns the oldest assets, which is what
+    // we want to avoid.
+    final option = FilterOptionGroup(
+      orders: [
+        const OrderOption(type: OrderOptionType.createDate, asc: false),
+      ],
+    );
     final albums = await PhotoManager.getAssetPathList(
       type: RequestType.common,
       onlyAll: true,
+      filterOption: option,
     );
     if (albums.isEmpty) {
       if (mounted) setState(() => _loading = false);
       return;
     }
-    final list = await albums.first.getAssetListPaged(page: 0, size: 120);
+    final album = albums.first;
+    final list = await album.getAssetListPaged(page: 0, size: _pageSize);
     if (!mounted) return;
     setState(() {
+      _album = album;
       _assets = list;
+      _page = 0;
+      _hasMore = list.length >= _pageSize;
       _loading = false;
     });
   }
@@ -215,12 +272,20 @@ class _AlbumScreenState extends ConsumerState<AlbumScreen> {
       );
     }
     return MasonryGridView.count(
+      controller: _scroll,
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
       crossAxisCount: 3,
       mainAxisSpacing: 10,
       crossAxisSpacing: 10,
-      itemCount: _assets.length,
+      itemCount: _assets.length + (_loadingMore ? 1 : 0),
       itemBuilder: (context, i) {
+        if (i >= _assets.length) {
+          // Trailing spinner shown while the next page is being fetched.
+          return const SizedBox(
+            height: 80,
+            child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+          );
+        }
         final e = _assets[i];
         return GestureDetector(
           onTap: () => _openAsset(e),

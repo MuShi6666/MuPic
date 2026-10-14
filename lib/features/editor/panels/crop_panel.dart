@@ -59,18 +59,33 @@ class CropPanel extends ConsumerWidget {
     controller.commit();
   }
 
-  void _rotate(WidgetRef ref) {
+  void _rotate(WidgetRef ref, {required bool clockwise}) {
     final controller = ref.read(editorProvider.notifier);
     controller.updateAdjustment((a) {
-      // Rotate the framed rect 90° clockwise together with the output.
-      final rotated = Rect.fromLTRB(
-        1 - a.cropBottom,
-        a.cropLeft,
-        1 - a.cropTop,
-        a.cropRight,
-      );
+      // Rotate the framed rect 90° together with the output. Clockwise bumps
+      // the turn count and maps the rect (x,y)->(1-y,x); counter-clockwise is
+      // its inverse so the exported result keeps matching what the user framed.
+      final Rect rotated;
+      final double turns;
+      if (clockwise) {
+        rotated = Rect.fromLTRB(
+          1 - a.cropBottom,
+          a.cropLeft,
+          1 - a.cropTop,
+          a.cropRight,
+        );
+        turns = (a.cropTurns + 1).remainder(4);
+      } else {
+        rotated = Rect.fromLTRB(
+          a.cropTop,
+          1 - a.cropRight,
+          a.cropBottom,
+          1 - a.cropLeft,
+        );
+        turns = (a.cropTurns + 3) % 4; // == cropTurns - 1 (mod 4)
+      }
       return a.copyWith(
-        cropTurns: (a.cropTurns + 1).remainder(4),
+        cropTurns: turns,
         cropLeft: rotated.left,
         cropTop: rotated.top,
         cropRight: rotated.right,
@@ -153,10 +168,19 @@ class CropPanel extends ConsumerWidget {
             children: [
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () => _rotate(ref),
+                  onPressed: () => _rotate(ref, clockwise: false),
+                  icon: const Icon(PhosphorIconsRegular.arrowCounterClockwise,
+                      size: 20),
+                  label: const Text('左转'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => _rotate(ref, clockwise: true),
                   icon: const Icon(PhosphorIconsRegular.arrowClockwise,
                       size: 20),
-                  label: const Text('旋转 90°'),
+                  label: const Text('右转'),
                 ),
               ),
               const SizedBox(width: 10),
@@ -167,7 +191,7 @@ class CropPanel extends ConsumerWidget {
                       : null,
                   icon: const Icon(PhosphorIconsRegular.arrowsClockwise,
                       size: 20),
-                  label: const Text('重置裁切'),
+                  label: const Text('重置'),
                 ),
               ),
             ],
@@ -177,7 +201,7 @@ class CropPanel extends ConsumerWidget {
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 10, 14, 0),
             child: Text(
-              '已旋转 ${(adj.cropTurns * 90).round()}°，离开本页后画面生效。',
+              '已旋转 ${(adj.cropTurns * 90).round()}°，可直接拖动裁切框调整。',
               style: Theme.of(context)
                   .textTheme
                   .bodySmall
